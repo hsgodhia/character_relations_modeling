@@ -17,7 +17,7 @@ class Config(object):
         self.num_negs = 50
         self.char_dim = 50
         self.alpha_train_point = 15
-        self.train_epochs = 10
+        self.train_epochs = 20
         self.alpha_init_val = 0.5
         self.eval = False
         self.vocb_size = None
@@ -40,7 +40,6 @@ it is basically making it a unit vector for each word, so we are ignoring vector
 direction to use it in downstream tasks like similarity calculation and so on
 """
 We = cPickle.load(open('data/glove.We', 'rb')).astype('float32')
-We = np.nan_to_num(We)
 We = torch.from_numpy(We)
 We = F.normalize(We)
 
@@ -87,39 +86,51 @@ class RMNModel(nn.Module):
         if torch.cuda.is_available():
             self.alpha = self.alpha.cuda()
         self.train_alpha = False
-    
+        
     def set_train_alpha(self, val):
         self.train_alpha = val
         
     def update_alpha(self, input):
-        self.alpha = self.sigmoid(self.v_alpha(input))
-        #this is batch_size * 1
+        self.alpha = self.sigmoid(self.v_alpha(Variable(input.data)))
+        #this is batch_size * 1        
         
     # the dimension of input is T * B * S where T is the max number of spans available for a given (c1,c2,b) that
     # is considered in a batch B is the batch size and S is the max span size or the
     def forward(self, input):
         # seq is size N * M where N = batch size and M = max sequence length
         bk_id, char_ids, seq, seq_mask, neg_seq, neg_seq_mask, spans_count_l = input                
-        v_s = self.w_embed(seq)
+        drop_mask = self.dropout(seq_mask)
+        if self.training:
+            drop_mask = drop_mask * (1 - config.word_drop)
         # v_s has dimension say 8 * 116 * 300
         # is of size N * M * 300
-        seq_mask = seq_mask.unsqueeze(2).expand_as(v_s)
-        
+        v_s = self.w_embed(seq)
+
+        temp_ones = Variable(torch.ones(drop_mask.size(0), 1)).cuda()
+
+        # mean out the sequence dimension
+        seq_mask = seq_mask.unsqueeze(2)
         v_s_mask = v_s * seq_mask
-        v_s_dropmask = self.dropout(v_s_mask)
+        seq_mask_sums = torch.sum(seq_mask, 1)
+        seq_mask_sums = torch.max(seq_mask_sums, temp_ones)        
+        v_s_mask = torch.sum(v_s_mask, 1) / seq_mask_sums
             
-        v_s_mask = torch.sum(v_s_mask, 1).squeeze(1)
-        v_s_dropmask = torch.sum(v_s_dropmask, 1).squeeze(1)
-        # not sure if this transformation is needed as d goes to d itself
+        drop_mask = drop_mask.unsqueeze(2)
+        drop_mask_sums = torch.sum(drop_mask, 1)
+        drop_mask_sums = torch.max(drop_mask_sums, temp_ones)
+        
+        v_s_dropmask = v_s * drop_mask
+        v_s_dropmask = torch.sum(v_s_dropmask, 1) / drop_mask_sums
         v_s_dropmask = self.w_vs_to_emb(v_s_dropmask)
         # now v_s is of size (8, 300) one word embedding for each span
         
+        
         if neg_seq is not None:
             v_n = self.w_embed(neg_seq)
-            #even dropout the words of the negative samples that you choose
-            neg_seq_mask = neg_seq_mask.unsqueeze(2).expand_as(v_n)
+            #the negative words are not dropped out
+            neg_seq_mask = neg_seq_mask.unsqueeze(2)
             v_n = v_n * neg_seq_mask
-            v_n = torch.sum(v_n, 1).squeeze(1)
+            v_n = torch.sum(v_n, 1) / torch.sum(neg_seq_mask, 1)
             
         v_b, v_c = self.b_embed(bk_id), self.c_embed(char_ids)
         # returns vars of size 1*50 and 1*2*50
@@ -128,7 +139,7 @@ class RMNModel(nn.Module):
         v_b, v_c_1, v_c_2 = self.w_b_to_emb(v_b), self.w_c_to_emb(c1_var), self.w_c_to_emb(c2_var)
         # v_c_1 is of size N*300 and v_b of N*300
         v_c = v_c_1 + v_c_2
-
+        
         if spans_count_l is not None:
             # the second dimension is basically storing the maximum number of time steps that we can have for any data point
             seq_in = Variable(torch.zeros(BATCH_SIZE, max(spans_count_l), 300))
@@ -168,32 +179,38 @@ class RMNModel(nn.Module):
         del v_s
 
         # initalize
-        d_t, total_loss = None, None        
+        total_loss = 0
+        prev_d_t = Variable(torch.zeros(BATCH_SIZE, config.desc_dim), requires_grad=False)
         zrs = Variable(torch.zeros(BATCH_SIZE, config.num_negs), requires_grad=False)
-
         if torch.cuda.is_available():
             zrs = zrs.cuda()        
+            prev_d_t = prev_d_t.cuda()
             
         trajn = []
         # compute the d_t vectors in parallel
         for t in range(max(spans_count_l)):
             # the dropout one is used here to calculate the mixed span representation
-            v_st_dp = seq_in_dp[:, t, :]            
+            v_st_dp = seq_in_dp[:, t, :].detach()            
             # the default only seq mask and no dropout applied is used to calculate the loss
-            v_s_mask = seq_in[:, t, :]
+            v_st_mask = seq_in[:, t, :].detach()
             
             # 20 * 300
             h_in = v_st_dp + v_b + v_c
-            h_t = self.relu(h_in)
-            if d_t is None:
-                d_t = self.softmax(self.w_d_h(h_t))
-            else:
-                d_t = self.alpha * self.softmax(self.w_d_h(h_t) + self.w_d_prev(d_t)) + (1 - self.alpha) * d_t
-            
+            h_t = self.relu(h_in)     
+            d_t = self.alpha * self.softmax(self.w_d_h(h_t) + self.w_d_prev(prev_d_t))  + (1 - self.alpha) * prev_d_t
+            # dt is of size batch_Size * 30
+            sv = np.sum(np.isnan(d_t.data.cpu().numpy()).astype(int))
+            if sv > 0:
+                #pdb.set_trace()
+                print("got nan in d_t")
+
             # size is 1 * 300
-            if self.train_alpha:
+            if self.train_alpha:                
                 self.update_alpha(torch.cat((h_t, d_t, v_st_dp), 1))
-            
+                sv2 = np.sum(np.isnan(self.alpha.data.cpu().numpy()).astype(int))
+                if sv2 > 0:
+                    print("got nan in alpha")
+                    #pdb.set_trace()
             # save the relationship state for each time step and return it as the trajectory for the given data point
             # each data point corresponds to a single character pair and book and all spans of it
             if config.eval:
@@ -202,11 +219,10 @@ class RMNModel(nn.Module):
                 continue
             
             # this is the reconstruction vector made using the dictionary and the hidden state vector d_t
-            r_t = self.w_rel(d_t)            
-            
+            r_t = self.w_rel(d_t) # is of size BATCH * 300
             # normalization here            
             r_t = F.normalize(r_t) 
-            v_s_mask = F.normalize(v_s_mask) # default is euclidean along the dim=1
+            v_st_mask = F.normalize(v_st_mask) # default is euclidean along the dim=1
             neg_seq_in = F.normalize(neg_seq_in, 2, 2) # default eps is 1e-12
             
             # this is the negative loss in the max margin equation
@@ -218,8 +234,8 @@ class RMNModel(nn.Module):
             
             # each of these is a matrix of size BATCH_SIZE * 300
             # we are doing a similarity between the two vectors like a dot product
-            recon_loss = r_t * v_s_mask
-            recon_loss = torch.sum(recon_loss, 1).unsqueeze(1)
+            recon_loss = r_t * v_st_mask
+            recon_loss = torch.sum(recon_loss, 1, keepdim=True)
             # now the recon loss is of size BATCH_SIZE * 1
                 
             cur_loss = torch.sum(torch.max(zrs, 1 - recon_loss + v_n_res), 1)
@@ -227,11 +243,9 @@ class RMNModel(nn.Module):
             # this mask is for removing data points which dont have a valid value for this time step
             mask = Variable(torch.from_numpy((t < np.array(spans_count_l)).astype('float')).float()).cuda()
             loss = torch.dot(cur_loss, mask)
+            total_loss += loss
             
-            if total_loss is None:
-                total_loss = loss
-            else:
-                total_loss += loss            
+            prev_d_t = d_t
 
         w_rel_mat = self.w_rel.weight
         # w_rel is a weight matrix of size d * K so we want to normalize each of the K descriptors along the 0 axis
@@ -241,28 +255,22 @@ class RMNModel(nn.Module):
         id_mat = Variable(torch.eye(w_rel_mat_unit.size(1))).cuda()
         w_rel_mm = w_rel_mm.sub(id_mat)
         
-        ortho_penalty = 1e-6 * torch.sum(w_rel_mm ** 2)
+        ortho_penalty = 1e-6 * torch.norm(w_rel_mm)
         if total_loss is not None:
             total_loss += ortho_penalty
-        del seq_in, seq_in_dp, neg_seq_in, d_t, seq_mask, zrs
+        del seq_in, seq_in_dp, neg_seq_in, prev_d_t, d_t, seq_mask, zrs
         # if you want to return multiple things put them into a list else it throws an error
         return total_loss, trajn
 
-def weights_init(m):
-    if isinstance(m, nn.Linear):
-        #xavier needs fan-in and fan-out to be defined, which means rows and cols, so weight atleast 2D
-        init.xavier_uniform(m.weight.data)
-        if m.bias is not None:
-            init.uniform(m.bias.data)
 
 def train_epoch(mdl, optimizer):
     random.shuffle(span_data)
     losses, bk_l, ch_l, curr_l, cm_l, dp_l,  ns_l, nm_l, num_spans = [], [], [], [], [], [], [], [], []
     prc_batch_cn, batch_cnt = 0, 0
+    #temp_data = span_data[:200]
     for book, chars, curr, cm in span_data:
         # for each relation with s spans we generate n negative spans
         ns, nm = generate_negative_samples(num_traj, span_size, config.num_negs, span_data)
-
         book = torch.from_numpy(book).long()
         chars = torch.from_numpy(chars).long().view(1, 2)
         curr = torch.from_numpy(curr).long()
@@ -315,7 +323,8 @@ def train_epoch(mdl, optimizer):
         # process the remaining element which were not the % BATCH SIZE
         global BATCH_SIZE
         BATCH_SIZE = len(num_spans)
-
+        mdl.alpha = mdl.alpha[0].repeat(BATCH_SIZE, 1)
+        
         bk_in = Variable(torch.cat(bk_l))
         ch_in = Variable(torch.cat(ch_l))
         curr_in = Variable(torch.cat(curr_l))
@@ -350,12 +359,23 @@ def train(n_epochs):
     # transfer to gpu
     if torch.cuda.is_available():
         mdl.cuda()
-    mdl.apply(weights_init)
-
-    params = list(filter(lambda p: p.requires_grad, mdl.parameters()))
-
+        
+    # print parameters and initialize them here
     for name, p in mdl.named_parameters():
-        print(name, p.size(), p.requires_grad)
+        print(name, p.size(), p.requires_grad, type(p))
+        if name == 'c_embed.weight' or name == 'b_embed.weight':
+            print('init', name)
+            init.normal(p)
+        elif name == 'w_embed.weight':
+            continue
+        elif 'bias' not in name:
+            print('init', name)
+            init.xavier_uniform(p)
+        else:
+            print('init', name)
+            init.constant(p, 0)
+                
+    params = list(filter(lambda p: p.requires_grad, mdl.parameters()))
     print('total params', len(params))
     optimizer = optim.Adam(params)
     print 'done compiling, now training...'
@@ -370,12 +390,13 @@ def train(n_epochs):
         end_time = time.time()
         print 'done with epoch: ', epoch, ' cost =', eloss, 'time: ', end_time - start_time
         if min_loss is None or eloss < min_loss:
-            torch.save(mdl.state_dict(), "model_13_t.pth")
-            torch.save(optimizer.state_dict(), "optimizer_13_t.pth")
+            torch.save(mdl.state_dict(), "model_16.pth")
+            torch.save(optimizer.state_dict(), "optimizer_16.pth")
         global BATCH_SIZE
         BATCH_SIZE = 50
+        mdl.alpha = mdl.alpha[0].repeat(BATCH_SIZE, 1)
         
-    torch.save(mdl.state_dict(), "model_13_last_t.pth")
+    torch.save(mdl.state_dict(), "model_16_last.pth")
 
 """
 Since the descriptors are represented in the same 300 dimension space as that of the vocabulary
@@ -385,11 +406,13 @@ def save_descriptors(descriptor_log, weight_mat, We, revmap):
     We = We.numpy()
     # original weight matrix is emb_dim * desc_dim
     print 'writing descriptors...'
-    R = weight_mat.cpu().t().numpy() #this is of desc_dim * emb_dim
+    R = F.normalize(weight_mat, 2, 0).cpu().numpy() # now this is of emb_dim * desc_dim
+
     log = open(descriptor_log, 'w')
-    for ind in range(len(R)):
-        desc = R[ind] / np.linalg.norm(R[ind])
-        sims = We.dot(desc.T)
+    for ind in range(R.shape[1]):
+        desc = R[:,ind]        
+        # We is vocab * 300
+        sims = We.dot(desc)
         # this is a short cut way to reverse the array [::-1]
         ordered_words = np.argsort(sims)[::-1]
         desc_list = [ revmap[w] for w in ordered_words[:10]]
@@ -411,9 +434,10 @@ def save_trajectories(trajectory_log, span_data, bmap, cmap, mdl):
     for book, chars, curr, cm in span_data:
         c1, c2 = [cmap[c] for c in chars]
         bname = bmap[book[0]]
-        if bname != "Dracula" and bname != "StormIsland" and bname != "B004TSKL44" and bname != "B00FBZKZM2" and bname != "B00O2BOSTC" and bname not in potter_books:
+        if bname != 'Dracula' and bname != 'BourneBetrayal' and bname != 'RisingTides' and bname != 'BourneDeception':
             continue
-        
+        if c1 != 'Arthur' and c2 != 'Arthur':
+            continue
         book = torch.from_numpy(book).long()
         chars = torch.from_numpy(chars).long().unsqueeze(0)
 
@@ -432,7 +456,7 @@ def save_trajectories(trajectory_log, span_data, bmap, cmap, mdl):
             step = traj[ind].squeeze(0)
             traj_writer.writerow([bname, c1, c2, ind, step.numpy().tolist()])
         bc += 1
-        if bc > 10:
+        if bc > 5:
             break
     tlog.flush()
     tlog.close()
@@ -441,17 +465,17 @@ def test():
     global BATCH_SIZE
     BATCH_SIZE = 1
     print 'loading data...'
-    descriptor_log = 'descriptors_model_13_t.log'
-    trajectory_log = 'trajectories_13_t.log'        
+    descriptor_log = 'descriptors_model_16.log'
+    trajectory_log = 'trajectories_16.log'        
     print d_word, span_size, config.desc_dim, config.vocab_size, config.num_chars, config.num_books, num_traj
     config.eval = True
     mdl = RMNModel(config, We)
     if torch.cuda.is_available():
         mdl.cuda()        
-    saved_state = torch.load("model_13_t.pth")
+    saved_state = torch.load("model_16.pth")
     mdl.load_state_dict(saved_state)
     mdl.eval()
-    save_trajectories(trajectory_log, span_data, bmap, cmap, mdl)    
+    #save_trajectories(trajectory_log, span_data, bmap, cmap, mdl)    
     save_descriptors(descriptor_log, mdl.w_rel.weight.data, We, revmap)
 
 if __name__ == '__main__':
